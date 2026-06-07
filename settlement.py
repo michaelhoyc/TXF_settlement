@@ -143,6 +143,13 @@ def draw_chart(df_daily: pd.DataFrame, settlement_days: list[date]) -> str:
                 settlement_bars.append((bar_idx, top, bot, high, sd))
                 break
 
+    # 當月合約生命週期均價：以圖上實際偵測到的結算日為錨點，逐段計算累積均價
+    typical = (df_idx["Open"] + df_idx["High"] + df_idx["Low"] + df_idx["Close"]) / 4
+    cycle = pd.Series(0, index=df_idx.index)
+    for bar_idx, *_ in settlement_bars:
+        cycle.loc[bar_idx:] += 1
+    life_avg = typical.groupby(cycle).expanding().mean().reset_index(level=0, drop=True)
+
     fig, axes = mpf.plot(
         df_daily,
         type="candle",
@@ -156,6 +163,11 @@ def draw_chart(df_daily: pd.DataFrame, settlement_days: list[date]) -> str:
         xrotation=45,
     )
     ax = axes[0]
+
+    # 當月合約生命週期均價線（黃色）
+    ax.plot(np.arange(n), life_avg.values, color="#fbc02d", lw=1.3,
+            alpha=0.9, label="ContractAvg", zorder=5)
+    ax.legend(loc="upper left", fontsize=8)
 
     # 顏色清單：最新結算日使用深色，最舊用淺色
     colors = list(reversed(_BAND_COLORS))  # index 0 = 最舊
@@ -294,7 +306,8 @@ def main() -> None:
         msg = (
             f"📅 *台指期 結算區間圖*\n"
             f"最近結算日：`{latest.strftime('%Y/%m/%d')}`\n"
-            f"查詢期間：`{start_str}` ~ `{end_str}`\n\n"
+            f"查詢期間：`{start_str}` ~ `{end_str}`\n"
+            f"🟡 黃線：當月合約生命週期均價（ContractAvg）\n\n"
             f"*歷史結算日列表：*\n{sd_lines}"
         )
 
