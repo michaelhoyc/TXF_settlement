@@ -49,6 +49,8 @@ from txf_settlement import (
     parse_taifex_fsp_html,
     require_shioaji_keys,
     settlement_label,
+    split_today,
+    taifex_daily_chunks,
     band_color,
     trading_days_covering,
 )
@@ -64,7 +66,6 @@ USER_AGENT = "txf-settlement/1.1"
 HTTP_TIMEOUT = 30
 HTTP_RETRIES = 3
 KBAR_CHUNK_DAYS = 30
-DAILY_CHUNK_DAYS = 30
 
 log = logging.getLogger("txf_settlement")
 
@@ -135,7 +136,7 @@ def decode_taifex_csv(content: bytes) -> str:
 def fetch_taifex_sessions(session: requests.Session, start: date, end: date):
     collected = []
     failed: list[str] = []
-    for chunk_start, chunk_end in date_chunks(start, end, DAILY_CHUNK_DAYS):
+    for chunk_start, chunk_end in taifex_daily_chunks(start, end):
         payload = {
             "down_type": "1",
             "commodity_id": "TX",
@@ -534,16 +535,17 @@ def _post_photo(path: str, caption: str, parse_mode: str | None) -> tuple[bool, 
     return False, description
 
 
-def send_tg_photo(path: str, caption: str) -> None:
+def send_tg_photo(path: str, caption: str) -> bool:
+    """回傳是否送達。沒設定 TG 視為刻意略過，回傳 True；有設定但送不出去回傳 False。"""
     token = os.getenv("TG_TOKEN", "")
     chat_id = os.getenv("TG_CHAT_ID", "")
     if not token or not chat_id:
         log.warning("Telegram 設定不完整，跳過發送")
-        return
+        return True
     ok, description = _post_photo(path, caption, "Markdown")
     if ok:
         log.info("Telegram 發送成功")
-        return
+        return True
     lowered = description.lower()
     if "parse" in lowered or "markdown" in lowered or "can't" in lowered:
         log.warning("Markdown 發送失敗，改以純文字再試一次")
@@ -551,6 +553,9 @@ def send_tg_photo(path: str, caption: str) -> None:
         ok, _ = _post_photo(path, plain, None)
         if ok:
             log.info("Telegram 純文字發送成功")
+            return True
+    log.error("Telegram 沒有送達")
+    return False
 
 
 def run(options, today: date | None = None) -> int:
@@ -573,6 +578,7 @@ def run(options, today: date | None = None) -> int:
         bundled,
         bundled_start,
         bundled_end,
+        today=today,
     )
     for warning in calendar_warnings:
         log.warning("%s", warning)
@@ -603,11 +609,16 @@ def run(options, today: date | None = None) -> int:
     except DataError as exc:
         log.warning("%s", exc)
         sessions = []
+    sessions, today_ready = split_today(sessions, today)
+    if not today_ready:
+        log.info("今天 %s 的日盤還沒公布，今天不畫入日K", today.isoformat())
 
     frame, frame_warnings = build_front_month_frame(
         sessions, plan, options.include_night, trading_days
     )
     expected = expected_trading_days(plan, today, trading_days)
+    if not today_ready:
+        expected = [day for day in expected if day != today]
     missing = missing_trading_days(frame, expected)
     if missing:
         sample = ", ".join(day.isoformat() for day in missing[:8])
@@ -653,10 +664,12 @@ def run(options, today: date | None = None) -> int:
     )
     log.info("發送 Telegram...")
     try:
-        send_tg_photo(path, caption)
+        sent = send_tg_photo(path, caption)
     finally:
         if os.path.exists(path):
             os.remove(path)
+    if not sent:
+        return 1
     log.info("完成")
     return 0
 

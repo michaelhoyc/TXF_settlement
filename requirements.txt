@@ -2,6 +2,7 @@ shioaji[speed]>=1.2.0
 pandas>=2.0
 numpy>=1.24
 mplfinance>=0.12.9b0
+six>=1.16  # mplfinance 0.12.10b0 會 import six，但沒有列為相依套件
 matplotlib>=3.7
 requests>=2.31
 python-dotenv>=1.0

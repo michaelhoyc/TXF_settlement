@@ -214,7 +214,19 @@ def _weekday_fill_warning(start: date, end: date) -> str:
     )
 
 
-def _fill_outside(covered: set[date], start: date, end: date, known_start: date, known_end: date) -> list[str]:
+def _fill_outside(
+    covered: set[date],
+    start: date,
+    end: date,
+    known_start: date,
+    known_end: date,
+    today: date | None = None,
+) -> list[str]:
+    """補週一至週五並回傳警告。
+
+    today 有給時，整段都在 today 之後的缺口只寫 log、不回傳：那段只用來決定
+    下一個未到期契約的歸屬，不影響圖上任何一根 K 棒，不必每次都出現在推播裡。
+    """
     warnings: list[str] = []
     if start < known_start:
         missing_end = known_start - timedelta(days=1)
@@ -223,7 +235,11 @@ def _fill_outside(covered: set[date], start: date, end: date, known_start: date,
     if end > known_end:
         missing_start = known_end + timedelta(days=1)
         covered |= weekdays_between(missing_start, end)
-        warnings.append(_weekday_fill_warning(missing_start, end))
+        message = _weekday_fill_warning(missing_start, end)
+        if today is not None and missing_start > today:
+            log.info("%s（只影響未來契約歸屬，不列入推播）", message)
+        else:
+            warnings.append(message)
     return warnings
 
 
@@ -234,15 +250,16 @@ def trading_days_covering(
     bundled: set[date] | None = None,
     bundled_start: date | None = None,
     bundled_end: date | None = None,
+    today: date | None = None,
 ) -> tuple[set[date], list[str]]:
     """有線上交易日就用線上的。線上或內建都沒蓋到的日期，才退回週一至週五。"""
     if live_days:
         covered = set(live_days)
-        return covered, _fill_outside(covered, start, end, min(covered), max(covered))
+        return covered, _fill_outside(covered, start, end, min(covered), max(covered), today)
     if bundled is None or bundled_start is None or bundled_end is None:
         bundled, bundled_start, bundled_end = load_bundled_calendar()
     covered = {day for day in bundled if start <= day <= end}
-    warnings = _fill_outside(covered, start, end, bundled_start, bundled_end)
+    warnings = _fill_outside(covered, start, end, bundled_start, bundled_end, today)
     if warnings:
         warnings[0] = (
             "內建交易日曆僅涵蓋 "
@@ -852,6 +869,34 @@ def date_chunks(start: date, end: date, step_days: int = 30):
         chunk_end = min(end, cursor + timedelta(days=step_days - 1))
         yield cursor, chunk_end
         cursor = chunk_end + timedelta(days=1)
+
+
+def taifex_daily_chunks(start: date, end: date):
+    """期交所每日行情（futDataDown）一次最多查一個日曆月。
+
+    超過就回傳網頁而不是 CSV（2026-11-04 實測：02/24～03/24 可、02/24～03/25 不可）。
+    固定 30 天的切法只要跨到二月就會超過，所以改成逐段算「起日＋1 個月－1 天」。
+    """
+    cursor = start
+    while cursor <= end:
+        year, month = add_months(cursor.year, cursor.month, 1)
+        last_day = calendar.monthrange(year, month)[1]
+        limit = date(year, month, min(cursor.day, last_day)) - timedelta(days=1)
+        chunk_end = min(end, limit)
+        yield cursor, chunk_end
+        cursor = chunk_end + timedelta(days=1)
+
+
+def split_today(sessions: list[DailySession], today: date) -> tuple[list[DailySession], bool]:
+    """今天的日盤還沒公布時，把今天的列（只有昨晚夜盤）拿掉。
+
+    期交所把「昨晚夜盤＋今天日盤」記在今天，盤中就會先出現一筆只有夜盤的今天。
+    回傳 (過濾後的列, 今天是否已有日盤)。
+    """
+    has_day = any(row.trade_date == today and row.session == "day" for row in sessions)
+    if has_day:
+        return list(sessions), True
+    return [row for row in sessions if row.trade_date != today], False
 
 
 def kbars_frame(raw: pd.DataFrame) -> pd.DataFrame:

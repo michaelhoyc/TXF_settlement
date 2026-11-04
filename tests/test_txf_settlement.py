@@ -454,3 +454,74 @@ def test_draw_chart_smoke(tmp_path):
     assert written.exists()
     assert written.stat().st_size > 1000
     written.unlink()
+
+
+# ---- 2026-11-04 修正 ----
+
+from txf_settlement import add_months, split_today, taifex_daily_chunks  # noqa: E402
+
+
+def _one_month_after(day: date) -> date:
+    import calendar as _cal
+
+    year, month = add_months(day.year, day.month, 1)
+    return date(year, month, min(day.day, _cal.monthrange(year, month)[1]))
+
+
+@pytest.mark.parametrize(
+    "start,end",
+    [
+        (date(2026, 2, 24), date(2026, 11, 4)),  # 實際出錯的區間：舊切法 02/24～03/25 被期交所拒絕
+        (date(2025, 1, 31), date(2025, 4, 2)),   # 月底起算＋二月
+        (date(2024, 1, 30), date(2024, 3, 5)),   # 閏年二月
+    ],
+)
+def test_taifex_chunks_never_exceed_one_calendar_month(start, end):
+    chunks = list(taifex_daily_chunks(start, end))
+    assert chunks[0][0] == start and chunks[-1][1] == end
+    for (a, b), (c, _d) in zip(chunks, chunks[1:]):
+        assert c == b + pd.Timedelta(days=1).to_pytimedelta()
+    for a, b in chunks:
+        assert a <= b < _one_month_after(a)
+
+
+def _row(day: date, session: str) -> DailySession:
+    return DailySession(day, "202611", session, 1.0, 2.0, 0.5, 1.5, 10)
+
+
+def test_split_today_drops_night_only_row_before_day_session_published():
+    today = date(2026, 11, 4)
+    rows = [_row(date(2026, 11, 3), "day"), _row(date(2026, 11, 3), "night"), _row(today, "night")]
+    kept, ready = split_today(rows, today)
+    assert not ready
+    assert all(row.trade_date != today for row in kept)
+    kept, ready = split_today(rows + [_row(today, "day")], today)
+    assert ready and len(kept) == 4
+
+
+def test_future_only_calendar_gap_is_not_a_caption_warning():
+    live = {date(2026, 12, 30), date(2026, 12, 31)}
+    covered, warnings = trading_days_covering(
+        date(2026, 12, 30), date(2027, 1, 5), live, today=date(2026, 12, 31)
+    )
+    assert date(2027, 1, 4) in covered  # 仍以週一至週五補上
+    assert warnings == []
+    _covered, warnings = trading_days_covering(
+        date(2026, 12, 30), date(2027, 1, 5), live, today=date(2027, 1, 4)
+    )
+    assert warnings  # 缺口涵蓋今天時仍要警告
+
+
+def test_send_tg_photo_reports_failure(monkeypatch, tmp_path):
+    import settlement
+
+    photo = tmp_path / "x.png"
+    photo.write_bytes(b"png")
+    monkeypatch.setenv("TG_TOKEN", "t")
+    monkeypatch.setenv("TG_CHAT_ID", "c")
+    monkeypatch.setattr(settlement, "_post_photo", lambda *a, **k: (False, "Forbidden: bot was blocked"))
+    assert settlement.send_tg_photo(str(photo), "cap") is False
+    monkeypatch.setattr(settlement, "_post_photo", lambda *a, **k: (True, ""))
+    assert settlement.send_tg_photo(str(photo), "cap") is True
+    monkeypatch.delenv("TG_TOKEN")
+    assert settlement.send_tg_photo(str(photo), "cap") is True  # 沒設定＝刻意略過
