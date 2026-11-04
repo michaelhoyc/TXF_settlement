@@ -1,112 +1,73 @@
 #!/usr/bin/env python3
-"""台指期結算區間 - 標記近 N 個月結算日的開收盤價格帶（日K棒圖）"""
-import os
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
-from dotenv import load_dotenv
-load_dotenv(".env")
+"""台指期結算區間：指定月份日 K、官方最後結算價，並推播到 Telegram。
 
-import sys
-import calendar
+日 K 優先使用期交所每日行情的指定契約月份，避免 TXFR1 在結算日把新舊月份混在一起。
+官方最後結算價來一期交所「指數期貨最後結算價」。Shioaji 只在期交所缺日、
+且該月份仍未到期時，用單月合約補資料。
+"""
+from __future__ import annotations
+
 import logging
+import os
+import sys
 import time
-import requests
-import numpy as np
-import pandas as pd
+from datetime import date
+from pathlib import Path
+
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import mplfinance as mpf
-import shioaji as sj
-from datetime import datetime, date, timedelta
+import pandas as pd
+import requests
+from dotenv import load_dotenv
 
-# ─── 設定 ────────────────────────────────────────────────────────────────────
-LOOKBACK_MONTHS = int(sys.argv[1]) if len(sys.argv) > 1 else 8
-
-TG_TOKEN   = os.getenv("TG_TOKEN", "")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
-API_KEY    = os.getenv("API_KEY", "")
-SECRET_KEY = os.getenv("SECRET_KEY", "")
-
-TEMP_DIR = os.path.join(os.path.dirname(__file__), "temp")
-LOG_DIR  = os.path.join(os.path.dirname(__file__), "logs")
-os.makedirs(TEMP_DIR, exist_ok=True)
-os.makedirs(LOG_DIR, exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(
-            os.path.join(LOG_DIR, f"settlement_{datetime.now().strftime('%Y%m%d')}.log"),
-            encoding="utf-8",
-        ),
-    ],
+from txf_settlement import (
+    LABEL_OFFSET_RATIO,
+    BAND_COLORS,
+    ConfigError,
+    DataError,
+    PriceBand,
+    SettlementPlan,
+    active_contract_month,
+    build_caption,
+    build_front_month_frame,
+    build_plan,
+    calendar_window,
+    date_chunks,
+    expected_trading_days,
+    kbars_frame,
+    load_bundled_calendar,
+    match_price_bands,
+    minute_bars_to_sessions,
+    missing_trading_days,
+    parse_cli,
+    parse_finmind_fsp,
+    parse_finmind_trading_dates,
+    parse_taifex_daily_csv,
+    parse_taifex_fsp_html,
+    require_shioaji_keys,
+    settlement_label,
+    band_color,
+    trading_days_covering,
 )
-log = logging.getLogger(__name__)
 
-# 每個結算區間的顏色（由舊到新，舊的較淡，最新的最深）
-_BAND_COLORS = [
-    "#1565C0",  # 深藍（最新）
-    "#1976D2",
-    "#1E88E5",
-    "#2196F3",
-    "#42A5F5",
-    "#64B5F6",
-    "#90CAF9",
-    "#BBDEFB",  # 淺藍（最舊）
-]
+ROOT = Path(__file__).resolve().parent
+TEMP_DIR = ROOT / "temp"
+LOG_DIR = ROOT / "logs"
 
+TAIFEX_DAILY_URL = "https://www.taifex.com.tw/cht/3/futDataDown"
+TAIFEX_FSP_URL = "https://www.taifex.com.tw/cht/5/futIndxFSP"
+FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+USER_AGENT = "txf-settlement/1.1"
+HTTP_TIMEOUT = 30
+HTTP_RETRIES = 3
+KBAR_CHUNK_DAYS = 30
+DAILY_CHUNK_DAYS = 30
 
-# ─── 結算日計算 ────────────────────────────────────────────────────────────────
-def get_settlement_day(year: int, month: int) -> date:
-    """台指期結算日：每月第三個星期三"""
-    cal = calendar.monthcalendar(year, month)
-    wednesdays = [w[calendar.WEDNESDAY] for w in cal if w[calendar.WEDNESDAY] != 0]
-    return date(year, month, wednesdays[2])
+log = logging.getLogger("txf_settlement")
 
-
-def get_recent_settlement_days(n: int) -> list[date]:
-    """取得最近 n 個結算日（不超過今日），由舊到新排序"""
-    today = date.today()
-    results: list[date] = []
-    year, month = today.year, today.month
-
-    while len(results) < n:
-        sd = get_settlement_day(year, month)
-        if sd <= today:
-            results.append(sd)
-        month -= 1
-        if month == 0:
-            year -= 1
-            month = 12
-
-    return sorted(results)
-
-
-# ─── Telegram ────────────────────────────────────────────────────────────────
-def send_tg_photo(file_path: str, caption: str) -> None:
-    if not TG_TOKEN or not TG_CHAT_ID:
-        log.warning("Telegram 設定不完整，跳過發送")
-        return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
-    with open(file_path, "rb") as f:
-        try:
-            res = requests.post(
-                url,
-                data={"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "Markdown"},
-                files={"photo": f},
-                timeout=30,
-            ).json()
-            if res.get("ok"):
-                log.info("Telegram 發送成功")
-            else:
-                log.error(f"Telegram 發送失敗: {res.get('description')}")
-        except Exception as e:
-            log.error(f"Telegram 連線錯誤: {e}")
-
-
-# ─── 繪圖 ─────────────────────────────────────────────────────────────────────
 _STYLE = mpf.make_mpf_style(
     base_mpf_style="yahoo",
     marketcolors=mpf.make_marketcolors(
@@ -116,97 +77,397 @@ _STYLE = mpf.make_mpf_style(
 )
 
 
-def draw_chart(df_daily: pd.DataFrame, settlement_days: list[date]) -> str:
-    """
-    繪製日K棒 + 結算區間帶（每個結算日的開收盤價格帶，向右延伸至圖表邊緣）
-    """
-    n = len(df_daily)
-    df_idx = df_daily.reset_index()
+def setup_logging() -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(
+                LOG_DIR / f"settlement_{date.today().strftime('%Y%m%d')}.log",
+                encoding="utf-8",
+            ),
+        ],
+        force=True,
+    )
 
-    # 找出每個結算日在 DataFrame 中對應的 bar index
-    # 計算動態偏移量（整體 High/Low 範圍的 0.5%）
-    y_range = float(df_daily["High"].max() - df_daily["Low"].min())
-    label_offset = y_range * 0.24
 
-    settlement_bars: list[tuple[int, float, float, float, date]] = []
-    for sd in settlement_days:
-        sd_ts = pd.Timestamp(sd)
-        # 允許 ±2 個交易日的偏差（應付例假日）
-        for delta in range(0, 3):
-            mask = df_idx["ts"].dt.normalize() == sd_ts + pd.Timedelta(days=delta)
-            if mask.any():
-                bar_idx = int(df_idx[mask].index[0])
-                row = df_idx.loc[bar_idx]
-                top  = max(float(row["Open"]), float(row["Close"]))
-                bot  = min(float(row["Open"]), float(row["Close"]))
-                high = float(row["High"])
-                settlement_bars.append((bar_idx, top, bot, high, sd))
-                break
+def make_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": USER_AGENT,
+            "Referer": "https://www.taifex.com.tw/cht/3/futDailyMarketView",
+        }
+    )
+    return session
 
-    # 當月合約生命週期均價：以圖上實際偵測到的結算日為錨點，逐段計算累積均價
-    typical = (df_idx["Open"] + df_idx["High"] + df_idx["Low"] + df_idx["Close"]) / 4
-    cycle = pd.Series(0, index=df_idx.index)
-    for bar_idx, *_ in settlement_bars:
-        cycle.loc[bar_idx:] += 1
-    life_avg = typical.groupby(cycle).expanding().mean().reset_index(level=0, drop=True)
+
+def request_with_retry(session: requests.Session, method: str, url: str, **kwargs) -> requests.Response:
+    timeout = kwargs.pop("timeout", HTTP_TIMEOUT)
+    last_error: Exception | None = None
+    for attempt in range(1, HTTP_RETRIES + 1):
+        try:
+            response = session.request(method, url, timeout=timeout, **kwargs)
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            last_error = exc
+            log.warning("請求失敗 %s (%s/%s): %s", url.split("?", 1)[0], attempt, HTTP_RETRIES, exc.__class__.__name__)
+            if attempt < HTTP_RETRIES:
+                time.sleep(1.5 * attempt)
+    raise DataError(f"請求在 {HTTP_RETRIES} 次嘗試後仍失敗：{url.split('?', 1)[0]}") from last_error
+
+
+def decode_taifex_csv(content: bytes) -> str:
+    if content.lstrip().startswith(b"<"):
+        raise DataError("期交所每日行情回傳網頁而不是 CSV")
+    for encoding in ("cp950", "big5", "utf-8-sig", "utf-8"):
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    raise DataError("期交所每日行情的編碼無法解析")
+
+
+def fetch_taifex_sessions(session: requests.Session, start: date, end: date):
+    collected = []
+    failed: list[str] = []
+    for chunk_start, chunk_end in date_chunks(start, end, DAILY_CHUNK_DAYS):
+        payload = {
+            "down_type": "1",
+            "commodity_id": "TX",
+            "commodity_id2": "",
+            "queryStartDate": chunk_start.strftime("%Y/%m/%d"),
+            "queryEndDate": chunk_end.strftime("%Y/%m/%d"),
+        }
+        try:
+            response = request_with_retry(session, "POST", TAIFEX_DAILY_URL, data=payload, timeout=HTTP_TIMEOUT)
+            text = decode_taifex_csv(response.content)
+        except DataError as exc:
+            failed.append(f"{chunk_start.isoformat()}～{chunk_end.isoformat()}（{exc}）")
+            log.warning("期交所每日行情 %s～%s 失敗：%s", chunk_start, chunk_end, exc)
+            continue
+        rows = parse_taifex_daily_csv(text)
+        log.info("期交所 %s～%s 解析到 %s 筆 TX 月契約日／夜盤", chunk_start, chunk_end, len(rows))
+        collected.extend(rows)
+    if failed and not collected:
+        raise DataError("期交所每日行情全部失敗：" + "；".join(failed))
+    if failed:
+        log.warning("期交所有 %s 個區間沒抓到，稍後嘗試用 Shioaji 指定月份補齊", len(failed))
+    return collected
+
+
+def fetch_taifex_fsp(session: requests.Session, start: date, end: date) -> dict[date, float]:
+    payload = {
+        "commodityIds": "1",
+        "start_year": str(start.year),
+        "start_month": f"{start.month:02d}",
+        "end_year": str(end.year),
+        "end_month": f"{end.month:02d}",
+    }
+    response = request_with_retry(session, "POST", TAIFEX_FSP_URL, data=payload, timeout=HTTP_TIMEOUT)
+    response.encoding = response.apparent_encoding or "utf-8"
+    prices = parse_taifex_fsp_html(response.text)
+    if not prices:
+        raise DataError("期交所最後結算價頁面沒有解析到 TX 月契約")
+    return prices
+
+
+def fetch_finmind_fsp(session: requests.Session, start: date, end: date, token: str) -> dict[date, float]:
+    response = request_with_retry(
+        session,
+        "GET",
+        FINMIND_URL,
+        headers={"Authorization": f"Bearer {token}"},
+        params={
+            "dataset": "TaiwanFuturesFinalSettlementPrice",
+            "data_id": "TX",
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+        },
+        timeout=HTTP_TIMEOUT,
+    )
+    payload = response.json()
+    if payload.get("status") not in (200, "200"):
+        raise DataError(str(payload.get("msg") or "FinMind 最後結算價失敗"))
+    return parse_finmind_fsp(payload)
+
+
+def fetch_finmind_trading_days(
+    session: requests.Session,
+    start: date,
+    end: date,
+    token: str,
+) -> set[date]:
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    response = request_with_retry(
+        session,
+        "GET",
+        FINMIND_URL,
+        headers=headers,
+        params={
+            "dataset": "TaiwanStockTradingDate",
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+        },
+        timeout=HTTP_TIMEOUT,
+    )
+    payload = response.json()
+    if payload.get("status") not in (200, "200"):
+        raise DataError(str(payload.get("msg") or "FinMind 交易日曆失敗"))
+    days = parse_finmind_trading_dates(payload)
+    if not days:
+        raise DataError("FinMind 交易日曆是空的")
+    return days
+
+
+def load_final_prices(
+    session: requests.Session,
+    plan: SettlementPlan,
+    token: str,
+) -> tuple[dict[date, float], list[str]]:
+    start = min(item.effective for item in plan.displayed)
+    end = max(item.effective for item in plan.displayed)
+    warnings: list[str] = []
+    prices: dict[date, float] = {}
+    try:
+        prices = fetch_taifex_fsp(session, start, end)
+        log.info("期交所最後結算價取得 %s 筆月契約", len(prices))
+    except DataError as exc:
+        warnings.append(f"期交所最後結算價取得失敗：{exc}。不會用開收盤代替")
+
+    missing = [item for item in plan.displayed if item.effective not in prices]
+    if missing and token:
+        try:
+            extra = fetch_finmind_fsp(session, start, end, token)
+            filled = 0
+            for item in missing:
+                if item.effective in extra:
+                    prices[item.effective] = extra[item.effective]
+                    filled += 1
+            log.info("FinMind 最後結算價補上 %s 筆", filled)
+        except DataError as exc:
+            warnings.append(f"FinMind 最後結算價取得失敗：{exc}")
+    elif missing:
+        warnings.append(
+            f"{len(missing)} 個結算日沒有官方最後結算價。"
+            "可在 .env 設定 FINMIND_TOKEN（FinMind Backer 以上）作為備援。"
+            "程式不會用日盤開收盤或每日結算價冒充"
+        )
+    return prices, warnings
+
+
+def _call_with_retry(action, what: str, retries: int = 3):
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return action()
+        except Exception as exc:
+            last_error = exc
+            log.warning("%s 失敗 (%s/%s): %s", what, attempt, retries, exc.__class__.__name__)
+            if attempt < retries:
+                time.sleep(1.5 * attempt)
+    raise DataError(f"{what} 在 {retries} 次嘗試後仍失敗") from last_error
+
+
+def login_shioaji(api, api_key: str, secret_key: str) -> None:
+    def attempt() -> None:
+        try:
+            api.login(api_key=api_key, secret_key=secret_key, contracts_timeout=30000)
+        except TypeError:
+            api.login(api_key=api_key, secret_key=secret_key)
+
+    _call_with_retry(attempt, "Shioaji 登入")
+
+
+def fetch_kbars(api, contract, start: date, end: date):
+    def attempt():
+        try:
+            return api.kbars(contract, start=start.isoformat(), end=end.isoformat(), timeout=30000)
+        except TypeError:
+            return api.kbars(contract, start=start.isoformat(), end=end.isoformat())
+
+    return _call_with_retry(attempt, f"Shioaji K 棒 {start.isoformat()}～{end.isoformat()}")
+
+
+def iter_txf_contracts(api) -> list:
+    futures = getattr(getattr(api, "Contracts", None), "Futures", None)
+    if futures is None:
+        return []
+    group = getattr(futures, "TXF", None)
+    if group is None:
+        try:
+            group = futures["TXF"]
+        except Exception:
+            return []
+    if isinstance(group, dict):
+        return list(group.values())
+    try:
+        return list(group)
+    except TypeError:
+        return [value for name, value in vars(group).items() if not name.startswith("_")]
+
+
+def find_month_contract(api, contract_month: str):
+    """只接受指定月份代碼。TXFR1／TXFR2 會在結算日換 target，不能拿來補日 K。"""
+    for contract in iter_txf_contracts(api):
+        code = str(getattr(contract, "code", ""))
+        if code.endswith("R1") or code.endswith("R2"):
+            continue
+        delivery = str(getattr(contract, "delivery_month", "")).strip()
+        if delivery == contract_month:
+            return contract
+    return None
+
+
+def fetch_shioaji_sessions(missing: list[date], plan: SettlementPlan, trading_days: set[date]):
+    api_key = os.getenv("API_KEY", "")
+    secret_key = os.getenv("SECRET_KEY", "")
+    require_shioaji_keys(api_key, secret_key)
+    try:
+        import shioaji as sj
+    except ImportError as exc:
+        raise DataError("沒有安裝 shioaji，無法補齊缺日") from exc
+
+    by_month: dict[str, list[date]] = {}
+    for day in missing:
+        month = active_contract_month(day, plan.cycles)
+        if month:
+            by_month.setdefault(month, []).append(day)
+
+    api = sj.Shioaji(simulation=True)
+    collected = []
+    try:
+        log.info("登入 Shioaji (simulation)，只用指定月份合約補缺日")
+        login_shioaji(api, api_key, secret_key)
+        for month, days in by_month.items():
+            contract = find_month_contract(api, month)
+            if contract is None:
+                log.warning(
+                    "Shioaji 查無未到期的 TXF %s（到期月份通常無法再以單月代碼查詢，且不改用 TXFR1），略過 %s 日",
+                    month,
+                    len(days),
+                )
+                continue
+            code = getattr(contract, "code", month)
+            frames = []
+            for chunk_start, chunk_end in date_chunks(min(days), max(days), KBAR_CHUNK_DAYS):
+                log.info("抓取 %s (%s) 1 分 K %s～%s", code, month, chunk_start, chunk_end)
+                kbars = fetch_kbars(api, contract, chunk_start, chunk_end)
+                if not kbars or not getattr(kbars, "ts", None):
+                    log.warning("Shioaji %s %s～%s 沒有 K 棒", code, chunk_start, chunk_end)
+                    continue
+                frames.append(kbars_frame(pd.DataFrame({**kbars})))
+            if not frames:
+                continue
+            minute = pd.concat(frames).sort_index()
+            minute = minute[~minute.index.duplicated(keep="last")]
+            sessions = minute_bars_to_sessions(minute, month, trading_days)
+            log.info("Shioaji %s 收成 %s 筆日／夜盤", code, len(sessions))
+            collected.extend(sessions)
+    finally:
+        try:
+            api.logout()
+        except Exception:
+            log.warning("Shioaji 登出失敗")
+    return collected
+
+
+def draw_chart(
+    frame: pd.DataFrame,
+    bands: list[PriceBand],
+    lookback: int,
+    include_night: bool,
+    out_dir: Path | None = None,
+) -> str:
+    out_dir = Path(out_dir) if out_dir is not None else TEMP_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    candles = frame[["Open", "High", "Low", "Close", "Volume"]].copy()
+    count = len(candles)
+    y_range = float(candles["High"].max() - candles["Low"].min())
+    label_offset = y_range * LABEL_OFFSET_RATIO if y_range else 1.0
 
     fig, axes = mpf.plot(
-        df_daily,
+        candles,
         type="candle",
         style=_STYLE,
         volume=True,
-        title=f"TXF Settlement Zone  (Last {LOOKBACK_MONTHS} months)",
+        title=f"TXF Settlement Zone  (Last {lookback} months)",
         figsize=(18, 9),
         returnfig=True,
-        warn_too_much_data=n + 1,
+        warn_too_much_data=count + 1,
         datetime_format="%m/%d",
         xrotation=45,
     )
     ax = axes[0]
+    vwap = frame["vwap"] if "vwap" in frame.columns else pd.Series(index=candles.index, dtype=float)
+    if vwap.notna().any():
+        night = " +night" if include_night else ""
+        ax.plot(
+            range(count),
+            vwap.to_numpy(),
+            color="#fbc02d",
+            lw=1.3,
+            alpha=0.9,
+            label=f"ContractAvg VWAP{night}",
+            zorder=5,
+        )
+        ax.legend(loc="upper left", fontsize=8)
+    if vwap.isna().any():
+        ax.text(
+            0.01,
+            0.02,
+            "ContractAvg N/A before first anchored contract",
+            transform=ax.transAxes,
+            color="gray",
+            fontsize=8,
+            va="bottom",
+        )
 
-    # 當月合約生命週期均價線（黃色）
-    ax.plot(np.arange(n), life_avg.values, color="#fbc02d", lw=1.3,
-            alpha=0.9, label="ContractAvg", zorder=5)
-    ax.legend(loc="upper left", fontsize=8)
-
-    # 顏色清單：最新結算日使用深色，最舊用淺色
-    colors = list(reversed(_BAND_COLORS))  # index 0 = 最舊
-    n_colors = len(colors)
-
-    for i, (bar_idx, top, bot, high, sd) in enumerate(settlement_bars):
-        color = colors[min(i, n_colors - 1)]
-
-        # 從結算日延伸到圖表右端的半透明帶
+    positions = {pd.Timestamp(ts).date(): index for index, ts in enumerate(candles.index)}
+    fsp_values = []
+    for index, band in enumerate(bands):
+        bar_idx = positions.get(band.bar_date)
+        if bar_idx is None:
+            log.warning("結算日 %s 無法對到圖上的座標，略過", band.bar_date.isoformat())
+            continue
+        color = band_color(index, len(bands), BAND_COLORS)
         ax.fill_between(
-            [bar_idx - 0.5, n - 0.5],
-            [bot, bot],
-            [top, top],
+            [bar_idx - 0.5, count - 0.5],
+            [band.bot, band.bot],
+            [band.top, band.top],
             color=color,
             alpha=0.20,
             linewidth=0,
             zorder=2,
         )
-
-        # 結算日上下緣各畫一條實線（強調區間邊界）
-        for y_val in (top, bot):
+        for level in (band.top, band.bot):
             ax.plot(
-                [bar_idx - 0.5, n - 0.5],
-                [y_val, y_val],
+                [bar_idx - 0.5, count - 0.5],
+                [level, level],
                 color=color,
                 linewidth=0.8,
                 alpha=0.7,
                 zorder=3,
             )
-
-        # 結算日垂直虛線
-        ax.axvline(x=bar_idx, color=color, linestyle="--", alpha=0.6,
-                   linewidth=1.2, zorder=4)
-
-        # 標籤（顯示在 K 棒最高點上方，避免覆蓋影線）
+        if band.fsp is not None:
+            fsp_values.append(band.fsp)
+            ax.plot(
+                [bar_idx - 0.5, count - 0.5],
+                [band.fsp, band.fsp],
+                color=color,
+                linewidth=1.8,
+                linestyle="-",
+                zorder=4,
+            )
+        ax.axvline(x=bar_idx, color=color, linestyle="--", alpha=0.6, linewidth=1.2, zorder=4)
         ax.text(
             bar_idx,
-            high + label_offset,
-            f"{sd.month}/{sd.day}\nSettle",
+            band.high + label_offset,
+            settlement_label(band.settlement, band.fsp),
             color="navy",
             fontsize=7.5,
             fontweight="bold",
@@ -221,13 +482,15 @@ def draw_chart(df_daily: pd.DataFrame, settlement_days: list[date]) -> str:
                 linewidth=0.8,
             ),
         )
-
-        # 在 K 棒右側顯示區間數值（最新結算日才顯示，避免擁擠）
-        if i == len(settlement_bars) - 1:
+        if index == len(bands) - 1:
+            if band.fsp is None:
+                side = f" FSP N/A\n {band.top:.0f}\n ---\n {band.bot:.0f}"
+            else:
+                side = f" FSP {band.fsp:.0f}\n {band.top:.0f}\n ---\n {band.bot:.0f}"
             ax.text(
-                n - 0.4,
-                (top + bot) / 2,
-                f" {top:.0f}\n ───\n {bot:.0f}",
+                count - 0.4,
+                (band.top + band.bot) / 2,
+                side,
                 color=color,
                 fontsize=7,
                 va="center",
@@ -235,92 +498,190 @@ def draw_chart(df_daily: pd.DataFrame, settlement_days: list[date]) -> str:
                 zorder=6,
             )
 
-    tmp_path = os.path.join(TEMP_DIR, f"settlement_{int(time.time() * 1000)}.png")
-    fig.savefig(tmp_path, dpi=120, bbox_inches="tight")
+    if fsp_values:
+        ymin, ymax = ax.get_ylim()
+        pad = label_offset or 1.0
+        ax.set_ylim(min(ymin, min(fsp_values) - pad), max(ymax, max(fsp_values) + pad))
+
+    path = out_dir / f"settlement_{int(time.time() * 1000)}.png"
+    fig.savefig(path, dpi=120, bbox_inches="tight")
     plt.close(fig)
-    log.info(f"圖表儲存：{tmp_path}")
-    return tmp_path
+    log.info("圖表儲存：%s", path)
+    return str(path)
 
 
-# ─── Shioaji 資料抓取 ─────────────────────────────────────────────────────────
-def fetch_daily_kbars(api: sj.Shioaji, start_str: str, end_str: str) -> pd.DataFrame:
-    """
-    抓取 TXF 近月 1 分 K，resample 成日K（僅日盤 08:45~13:45）
-    """
-    contract = api.Contracts.Futures.TXF.TXFR1
-    log.info(f"抓取 1K K 棒 {start_str} ~ {end_str}...")
-    kbars = api.kbars(contract, start=start_str, end=end_str)
+def _post_photo(path: str, caption: str, parse_mode: str | None) -> tuple[bool, str]:
+    token = os.getenv("TG_TOKEN", "")
+    chat_id = os.getenv("TG_CHAT_ID", "")
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    data = {"chat_id": chat_id, "caption": caption}
+    if parse_mode:
+        data["parse_mode"] = parse_mode
+    try:
+        with open(path, "rb") as handle:
+            response = requests.post(url, data=data, files={"photo": handle}, timeout=HTTP_TIMEOUT)
+        body = response.json()
+    except requests.RequestException as exc:
+        log.error("Telegram 連線錯誤: %s", exc.__class__.__name__)
+        return False, exc.__class__.__name__
+    except ValueError:
+        log.error("Telegram 回應不是 JSON")
+        return False, "invalid json"
+    if body.get("ok"):
+        return True, ""
+    description = str(body.get("description") or "")
+    log.error("Telegram 發送失敗: %s", description)
+    return False, description
 
-    if not kbars or not kbars.ts:
-        raise RuntimeError("無 K 棒資料，請確認日期範圍是否含有交易日")
 
-    df = pd.DataFrame({**kbars})
-    df["ts"] = pd.to_datetime(df["ts"])
-    df.set_index("ts", inplace=True)
-    df.rename(columns={"open": "Open", "high": "High", "low": "Low",
-                        "close": "Close", "volume": "Volume"}, inplace=True)
+def send_tg_photo(path: str, caption: str) -> None:
+    token = os.getenv("TG_TOKEN", "")
+    chat_id = os.getenv("TG_CHAT_ID", "")
+    if not token or not chat_id:
+        log.warning("Telegram 設定不完整，跳過發送")
+        return
+    ok, description = _post_photo(path, caption, "Markdown")
+    if ok:
+        log.info("Telegram 發送成功")
+        return
+    lowered = description.lower()
+    if "parse" in lowered or "markdown" in lowered or "can't" in lowered:
+        log.warning("Markdown 發送失敗，改以純文字再試一次")
+        plain = caption.replace("\\", "")
+        ok, _ = _post_photo(path, plain, None)
+        if ok:
+            log.info("Telegram 純文字發送成功")
 
-    # 只取日盤時段，避免夜盤的不同日期歸屬問題
-    df_day = df.between_time("08:45", "13:45")
 
-    df_daily = (
-        df_day.resample("1D")
-        .agg({"Open": "first", "High": "max", "Low": "min",
-              "Close": "last", "Volume": "sum"})
-        .dropna()
+def run(options, today: date | None = None) -> int:
+    today = today or date.today()
+    window_start, window_end = calendar_window(options.lookback, today)
+    session = make_session()
+    token = os.getenv("FINMIND_TOKEN", "")
+    live_days = None
+    try:
+        live_days = fetch_finmind_trading_days(session, window_start, window_end, token)
+        log.info("交易日曆來源：FinMind，%s 個交易日", len(live_days))
+    except DataError as exc:
+        log.warning("FinMind 交易日曆取得失敗，改用內建日曆：%s", exc)
+
+    bundled, bundled_start, bundled_end = load_bundled_calendar()
+    trading_days, calendar_warnings = trading_days_covering(
+        window_start,
+        window_end,
+        live_days,
+        bundled,
+        bundled_start,
+        bundled_end,
     )
-    df_daily = df_daily[df_daily["Volume"] > 0]
-    log.info(f"日K 共 {len(df_daily)} 根")
-    return df_daily
+    for warning in calendar_warnings:
+        log.warning("%s", warning)
 
-
-# ─── 主程式 ─────────────────────────────────────────────────────────────────
-def main() -> None:
-    assert API_KEY and SECRET_KEY, "請在 .env 設定 API_KEY / SECRET_KEY"
-
-    settlement_days = get_recent_settlement_days(LOOKBACK_MONTHS)
-    log.info(f"結算日（{len(settlement_days)} 個）：{[str(d) for d in settlement_days]}")
-
-    # 查詢範圍：最早結算日前 10 天 ~ 今天
-    start_str = (settlement_days[0] - timedelta(days=10)).strftime("%Y-%m-%d")
-    end_str   = date.today().strftime("%Y-%m-%d")
-
-    log.info("登入 Shioaji (simulation)...")
-    api = sj.Shioaji(simulation=True)
-    api.login(api_key=API_KEY, secret_key=SECRET_KEY)
+    plan = build_plan(options.lookback, today, trading_days)
+    if plan.anchor is None:
+        log.warning("找不到前一次結算錨點，第一段 ContractAvg 不會畫")
+    else:
+        log.info(
+            "ContractAvg 錨點：%s 契約 %s，行情自 %s 起",
+            plan.anchor.effective.isoformat(),
+            plan.anchor.contract_month,
+            plan.data_start.isoformat(),
+        )
+    for item in plan.displayed:
+        if item.rolled:
+            log.info(
+                "結算日 %s 不是交易日，順延至 %s（契約 %s）",
+                item.nominal.isoformat(),
+                item.effective.isoformat(),
+                item.contract_month,
+            )
+        else:
+            log.info("結算日 %s（契約 %s）", item.effective.isoformat(), item.contract_month)
 
     try:
-        df_daily = fetch_daily_kbars(api, start_str, end_str)
+        sessions = fetch_taifex_sessions(session, plan.data_start, today)
+    except DataError as exc:
+        log.warning("%s", exc)
+        sessions = []
 
-        if len(df_daily) < 5:
-            log.error("日K 資料不足（< 5 根），請確認連線與日期範圍")
-            return
+    frame, frame_warnings = build_front_month_frame(
+        sessions, plan, options.include_night, trading_days
+    )
+    expected = expected_trading_days(plan, today, trading_days)
+    missing = missing_trading_days(frame, expected)
+    if missing:
+        sample = ", ".join(day.isoformat() for day in missing[:8])
+        suffix = "" if len(missing) <= 8 else f" 等共 {len(missing)} 日"
+        log.warning("日K對不到這些交易日：%s%s。嘗試用 Shioaji 指定月份補齊，不使用 TXFR1", sample, suffix)
+        try:
+            extra = fetch_shioaji_sessions(missing, plan, trading_days)
+            if extra:
+                sessions = list(sessions) + list(extra)
+                frame, frame_warnings = build_front_month_frame(
+                    sessions, plan, options.include_night, trading_days
+                )
+                missing = missing_trading_days(frame, expected)
+        except ConfigError as exc:
+            log.warning("%s", exc)
+        except DataError as exc:
+            log.warning("Shioaji 補齊失敗：%s", exc)
+        if missing:
+            sample = ", ".join(day.isoformat() for day in missing[:8])
+            suffix = "" if len(missing) <= 8 else f" 等共 {len(missing)} 日"
+            frame_warnings.append(f"仍有交易日沒有日K：{sample}{suffix}")
 
-        log.info("繪製圖表...")
-        path = draw_chart(df_daily, settlement_days)
+    for warning in frame_warnings:
+        log.warning("%s", warning)
 
-        latest = settlement_days[-1]
-        sd_lines = "\n".join(
-            [f"  · `{sd.strftime('%Y/%m/%d')}`  (週三)" for sd in reversed(settlement_days)]
-        )
-        msg = (
-            f"📅 *台指期 結算區間圖*\n"
-            f"最近結算日：`{latest.strftime('%Y/%m/%d')}`\n"
-            f"查詢期間：`{start_str}` ~ `{end_str}`\n"
-            f"🟡 黃線：當月合約生命週期均價（ContractAvg）\n\n"
-            f"*歷史結算日列表：*\n{sd_lines}"
-        )
+    if len(frame) < 5:
+        log.error("日K不足 5 根（目前 %s 根）。期交所與 Shioaji 都沒有足夠的指定月份資料", len(frame))
+        return 1
 
-        log.info("發送 Telegram...")
-        send_tg_photo(path, msg)
+    final_prices, price_warnings = load_final_prices(session, plan, token)
+    bands, band_warnings = match_price_bands(frame, plan.displayed, final_prices)
+    for warning in price_warnings + band_warnings:
+        log.warning("%s", warning)
 
+    log.info("日K共 %s 根，價格帶 %s 條", len(frame), len(bands))
+    path = draw_chart(frame, bands, options.lookback, options.include_night)
+    caption = build_caption(
+        bands,
+        plan.data_start,
+        today,
+        options.include_night,
+        calendar_warnings + frame_warnings + price_warnings + band_warnings,
+    )
+    log.info("發送 Telegram...")
+    try:
+        send_tg_photo(path, caption)
+    finally:
         if os.path.exists(path):
             os.remove(path)
+    log.info("完成")
+    return 0
 
-    finally:
-        api.logout()
-        log.info("完成")
+
+def main(argv: list[str] | None = None) -> int:
+    setup_logging()
+    os.chdir(ROOT)
+    load_dotenv(ROOT / ".env")
+    try:
+        options = parse_cli(list(sys.argv if argv is None else argv))
+    except ConfigError as exc:
+        log.error("%s", exc)
+        return 2
+    try:
+        return run(options)
+    except ConfigError as exc:
+        log.error("%s", exc)
+        return 2
+    except DataError as exc:
+        log.error("%s", exc)
+        return 1
+    except Exception:
+        log.exception("未預期的錯誤")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
